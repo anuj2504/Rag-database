@@ -1,0 +1,125 @@
+# ============================================================================
+# Enterprise RAG System - Dependencies
+# ============================================================================
+# Install: pip install -r requirements.txt
+# For GPU support: pip install torch --index-url https://download.pytorch.org/whl/cu118
+# ============================================================================
+
+# ============================================================================
+# DOCUMENT PROCESSING
+# ============================================================================
+# Unstructured.io for document parsing (PDF, DOCX, images)
+unstructured[all-docs]>=0.16.19
+unstructured-inference>=0.7.36
+
+# PDF handling
+pdf2image==1.17.0
+pypdf>=4.0.0
+pdfplumber>=0.10.3
+
+# OCR
+pytesseract==0.3.10
+pillow>=10.0.0
+
+# ============================================================================
+# CHUNKING
+# ============================================================================
+# Chonkie - Modern intelligent chunking
+chonkie>=0.2.0
+
+# NLTK for sentence tokenization (optional, for hierarchical chunking)
+nltk>=3.8.0
+
+# ============================================================================
+# EMBEDDINGS
+# ============================================================================
+# Sentence Transformers (BGE, MiniLM, etc.)
+sentence-transformers>=3.0.0
+
+# OpenAI (optional, for ada embeddings)
+openai>=1.40.0
+
+# PyTorch (CPU by default, see header for GPU)
+torch>=2.0.0
+transformers>=4.40.0
+
+# ColPali - Visual document understanding
+colpali-engine>=0.3.0
+
+# ============================================================================
+# VECTOR DATABASES
+# ============================================================================
+# Qdrant - Primary vector store
+qdrant-client>=1.10.0
+
+# Elasticsearch (optional, for BM25 at scale)
+# elasticsearch>=8.14.0
+
+# ============================================================================
+# KEYWORD SEARCH (BM25)
+# ============================================================================
+rank-bm25==0.2.2
+
+# ============================================================================
+# METADATA DATABASE
+# ============================================================================
+# SQLAlchemy ORM
+sqlalchemy>=2.0.31
+
+# PostgreSQL driver
+psycopg2-binary>=2.9.9
+
+# Database migrations
+alembic>=1.13.2
+
+# ============================================================================
+# API FRAMEWORK
+# ============================================================================
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.1
+python-multipart>=0.0.9
+
+# ============================================================================
+# DATA VALIDATION & SERIALIZATION
+# ============================================================================
+pydantic>=2.8.0
+pydantic-settings>=2.0.0
+
+# ============================================================================
+# UTILITIES
+# ============================================================================
+python-dotenv>=1.0.1
+tqdm>=4.66.4
+numpy>=1.24.0
+httpx>=0.27.0
+aiofiles>=23.2.0
+tenacity>=8.2.0
+python-dateutil>=2.8.0
+
+# ============================================================================
+# GRAPH (Optional - for document relationships)
+# ============================================================================
+networkx>=3.2.0
+
+# ============================================================================
+# TESTING
+# ============================================================================
+pytest>=8.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.1.0
+
+# ============================================================================
+# DEVELOPMENT
+# ============================================================================
+black>=24.0.0
+ruff>=0.3.0
+mypy>=1.8.0
+
+# ============================================================================
+# VERSION NOTES
+# ============================================================================
+# - Python 3.10+ required
+# - For Apple Silicon (M1/M2), torch should auto-detect MPS
+# - ColPali requires significant GPU memory (8GB+ recommended)
+# - For NVIDIA GPU: pip install torch --index-url https://download.pytorch.org/whl/cu118
+# ============================================================================
