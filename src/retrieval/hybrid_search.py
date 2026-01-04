@@ -196,11 +196,13 @@ class HybridSearcher:
 
         # BM25 search
         if RetrievalMethod.BM25 in methods and self.bm25_store:
+            logger.info(f"BM25 search: query='{query[:50]}', filters={filters}")
             bm25_results = self.bm25_store.search(
                 query=query,
                 limit=fetch_limit,
                 filters=filters
             )
+            logger.info(f"BM25 returned {len(bm25_results)} results")
             ranked_lists[RetrievalMethod.BM25.value] = [
                 (r.id, r.score) for r in bm25_results
             ]
@@ -221,17 +223,21 @@ class HybridSearcher:
                 limit=fetch_limit,
                 filters=filters
             )
+            # Use original_id from payload for fusion with BM25 (Qdrant converts IDs to UUIDs)
+            logger.info(f"Dense returned {len(dense_results)} results")
             ranked_lists[RetrievalMethod.DENSE.value] = [
-                (r.id, r.score) for r in dense_results
+                (r.payload.get("original_id", r.id), r.score) for r in dense_results
             ]
             for rank, r in enumerate(dense_results, 1):
-                if r.id not in all_results_by_id:
-                    all_results_by_id[r.id] = {
+                # Use original_id for consistent ID across all methods
+                doc_id = r.payload.get("original_id", r.id)
+                if doc_id not in all_results_by_id:
+                    all_results_by_id[doc_id] = {
                         "text": r.payload.get("text"),
                         "metadata": r.payload
                     }
-                all_results_by_id[r.id]["dense_score"] = r.score
-                all_results_by_id[r.id]["dense_rank"] = rank
+                all_results_by_id[doc_id]["dense_score"] = r.score
+                all_results_by_id[doc_id]["dense_rank"] = rank
 
         # ColPali search
         if RetrievalMethod.COLPALI in methods and self.colpali_store and self.colpali_embedder:
@@ -241,21 +247,31 @@ class HybridSearcher:
                 limit=fetch_limit,
                 filters=filters
             )
+            # Use original_id from payload for fusion (Qdrant converts IDs to UUIDs)
             ranked_lists[RetrievalMethod.COLPALI.value] = [
-                (r.id, r.score) for r in colpali_results
+                (r.payload.get("original_id", r.id), r.score) for r in colpali_results
             ]
             for rank, r in enumerate(colpali_results, 1):
-                if r.id not in all_results_by_id:
-                    all_results_by_id[r.id] = {
+                # Use original_id for consistent ID across all methods
+                doc_id = r.payload.get("original_id", r.id)
+                if doc_id not in all_results_by_id:
+                    all_results_by_id[doc_id] = {
                         "text": None,  # ColPali returns pages, not text chunks
                         "metadata": r.payload
                     }
-                all_results_by_id[r.id]["colpali_score"] = r.score
-                all_results_by_id[r.id]["colpali_rank"] = rank
+                all_results_by_id[doc_id]["colpali_score"] = r.score
+                all_results_by_id[doc_id]["colpali_rank"] = rank
 
         # Fuse results using RRF
         use_weights = weights or self.default_weights
         fused_results = self.rrf.fuse(ranked_lists, use_weights)
+
+        # Log fusion stats
+        logger.info(
+            f"RRF fusion: methods={list(ranked_lists.keys())}, "
+            f"counts={[len(v) for v in ranked_lists.values()]}, "
+            f"fused={len(fused_results)}"
+        )
 
         # Build final results
         results = []

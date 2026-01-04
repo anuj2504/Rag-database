@@ -1,6 +1,17 @@
 """
 Hierarchical Chunking with Document Structure Preservation.
 
+==============================================================================
+DEPRECATED: Use ChunkingService from src.chunking.chunking_service instead.
+
+    from src.chunking import ChunkingService, UnifiedChunk
+
+ChunkingService merges this module with Chonkie for better results.
+Structure detection code from this module is incorporated into ChunkingService.
+
+This file is kept for backward compatibility only.
+==============================================================================
+
 Key insight from enterprise RAG:
 - Documents have structure (sections, paragraphs, sentences)
 - Fixed-size chunking destroys this structure

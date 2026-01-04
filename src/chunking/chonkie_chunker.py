@@ -1,6 +1,17 @@
 """
 Chonkie-based Intelligent Chunking.
 
+==============================================================================
+DEPRECATED: Use ChunkingService from src.chunking.chunking_service instead.
+
+    from src.chunking import ChunkingService, UnifiedChunk
+
+ChunkingService integrates Chonkie with structure detection for better results.
+All Chonkie strategies (TOKEN, SENTENCE, SEMANTIC, SDPM) are available there.
+
+This file is kept for backward compatibility only.
+==============================================================================
+
 Chonkie is a modern chunking library that provides:
 - Semantic chunking (preserves meaning)
 - Token-aware chunking (works with any tokenizer)
@@ -20,8 +31,7 @@ import re
 from chonkie import (
     TokenChunker,
     SentenceChunker,
-    SemanticChunker,
-    SDPMChunker,  # Semantic Double-Pass Merging
+    SemanticChunker,  # With skip_window>0, provides SDPM behavior
     Chunk as ChonkieChunk,
 )
 from chonkie.embeddings import SentenceTransformerEmbeddings
@@ -163,19 +173,19 @@ class ChonkieChunkerWrapper:
             self._semantic_chunker = SemanticChunker(
                 embedding_model=embeddings,
                 chunk_size=self.chunk_size,
-                similarity_threshold=0.5,  # Semantic similarity threshold
+                threshold=0.5,  # Semantic similarity threshold
             )
         return self._semantic_chunker
 
-    def _get_sdpm_chunker(self) -> SDPMChunker:
-        """Get or create SDPM chunker (best quality)."""
+    def _get_sdpm_chunker(self) -> SemanticChunker:
+        """Get or create SDPM chunker (SemanticChunker with skip_window for double-pass merging)."""
         if self._sdpm_chunker is None:
             embeddings = SentenceTransformerEmbeddings(self.embedding_model)
-            self._sdpm_chunker = SDPMChunker(
+            self._sdpm_chunker = SemanticChunker(
                 embedding_model=embeddings,
                 chunk_size=self.chunk_size,
-                similarity_threshold=0.5,
-                skip_window=2,  # Look-ahead for merging
+                threshold=0.5,  # similarity threshold
+                skip_window=2,  # Enables SDPM-like double-pass merging
             )
         return self._sdpm_chunker
 

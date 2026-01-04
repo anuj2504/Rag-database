@@ -52,7 +52,7 @@ services:
       - POSTGRES_URL=postgresql://${POSTGRES_USER:-raguser}:${POSTGRES_PASSWORD:-ragpassword}@postgres:5432/${POSTGRES_DB:-rag_db}
       - QDRANT_HOST=qdrant
       - QDRANT_PORT=6333
-      - ENABLE_COLPALI=${ENABLE_COLPALI:-false}
+      - ENABLE_COLPALI=${ENABLE_COLPALI:-true}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
     volumes:
       - ./data:/app/data  # Persist BM25 index

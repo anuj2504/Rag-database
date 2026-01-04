@@ -21,7 +21,8 @@ from src.retrieval.hybrid_search import (
     RetrievalMethod,
     ReciprocalRankFusion
 )
-from src.chunking.hierarchical_chunker import ChunkLevel, QueryComplexityAnalyzer
+from src.chunking import ChunkLevel
+from src.chunking.hierarchical_chunker import QueryComplexityAnalyzer  # Still valid for query analysis
 from src.terminology.acronym_database import AcronymDatabase, QueryEnhancer, Domain
 from src.graph.document_graph import DocumentGraph, GraphAugmentedRetrieval, RelationType
 

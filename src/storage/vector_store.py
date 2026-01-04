@@ -24,6 +24,7 @@ from qdrant_client.http.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    MatchAny,
     Range,
     SearchParams,
     OptimizersConfigDiff,
@@ -291,11 +292,10 @@ class QdrantVectorStore(VectorStoreBase):
                     FieldCondition(key=key, range=Range(**range_params))
                 )
             elif isinstance(value, list):
-                # Match any in list
-                for v in value:
-                    conditions.append(
-                        FieldCondition(key=key, match=MatchValue(value=v))
-                    )
+                # Match any in list (OR logic)
+                conditions.append(
+                    FieldCondition(key=key, match=MatchAny(any=value))
+                )
             else:
                 # Exact match
                 conditions.append(
@@ -332,11 +332,15 @@ class QdrantVectorStore(VectorStoreBase):
     def get_collection_info(self) -> Dict[str, Any]:
         """Get collection statistics."""
         info = self.client.get_collection(self.collection_name)
+        # Handle different qdrant-client versions
+        vectors_count = getattr(info, 'vectors_count', None) or getattr(info, 'indexed_vectors_count', 0)
+        points_count = getattr(info, 'points_count', 0)
+        status = getattr(info, 'status', 'unknown')
         return {
             "name": self.collection_name,
-            "vectors_count": info.vectors_count,
-            "points_count": info.points_count,
-            "status": info.status,
+            "vectors_count": vectors_count,
+            "points_count": points_count,
+            "status": str(status),
             "dimension": self.dimension,
         }
 
@@ -423,35 +427,48 @@ class QdrantMultiVectorStore:
         self,
         ids: List[str],
         embeddings: List[np.ndarray],
-        payloads: List[Dict[str, Any]]
+        payloads: List[Dict[str, Any]],
+        batch_size: int = 5  # Small batch size due to large multi-vector payloads (~2MB per page)
     ) -> None:
         """
         Add page embeddings (multi-vector per page).
+
+        ColPali generates ~1030 patches per page × 128 dims = ~525KB per page.
+        When serialized to JSON, this grows to ~2MB per page.
+        Batching in groups of 5 keeps payload under 32MB limit.
 
         Args:
             ids: Page IDs (strings will be converted to UUIDs)
             embeddings: List of arrays, each (num_patches, 128)
             payloads: Metadata for each page
+            batch_size: Number of pages per batch (small due to large payloads)
         """
-        points = []
-        for page_id, emb, payload in zip(ids, embeddings, payloads):
-            # Convert string ID to UUID for Qdrant compatibility
-            qdrant_id = self._string_to_uuid(page_id)
-            # Store original ID in payload for retrieval
-            payload["original_id"] = page_id
-            points.append(
-                PointStruct(
-                    id=qdrant_id,
-                    vector={"patches": emb.tolist()},
-                    payload=payload
+        # Process in batches to avoid Qdrant payload size limits (32MB)
+        for i in range(0, len(ids), batch_size):
+            batch_ids = ids[i:i + batch_size]
+            batch_embeddings = embeddings[i:i + batch_size]
+            batch_payloads = payloads[i:i + batch_size]
+
+            points = []
+            for page_id, emb, payload in zip(batch_ids, batch_embeddings, batch_payloads):
+                # Convert string ID to UUID for Qdrant compatibility
+                qdrant_id = self._string_to_uuid(page_id)
+                # Store original ID in payload for retrieval
+                payload["original_id"] = page_id
+                points.append(
+                    PointStruct(
+                        id=qdrant_id,
+                        vector={"patches": emb.tolist()},
+                        payload=payload
+                    )
                 )
+
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True
             )
 
-        self.client.upsert(
-            collection_name=self.collection_name,
-            points=points,
-            wait=True
-        )
         logger.info(f"Added {len(ids)} pages to {self.collection_name}")
 
     def search(
@@ -476,9 +493,15 @@ class QdrantMultiVectorStore:
         if filters:
             conditions = []
             for key, value in filters.items():
-                conditions.append(
-                    FieldCondition(key=key, match=MatchValue(value=value))
-                )
+                if isinstance(value, list):
+                    # Match any in list (OR logic)
+                    conditions.append(
+                        FieldCondition(key=key, match=MatchAny(any=value))
+                    )
+                else:
+                    conditions.append(
+                        FieldCondition(key=key, match=MatchValue(value=value))
+                    )
             qdrant_filter = Filter(must=conditions)
 
         results = self.client.query_points(

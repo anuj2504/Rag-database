@@ -1,6 +1,20 @@
 """
 Enhanced Ingestion Pipeline with Enterprise Features.
 
+==============================================================================
+DEPRECATED: Use MasterPipeline from src.pipeline.master_pipeline instead.
+
+    from src.pipeline import create_master_pipeline
+
+MasterPipeline includes ALL features from this file plus:
+- Unified ChunkingService (Chonkie + Hierarchical merged)
+- Better quality-based strategy selection
+- UnifiedChunk type for consistency
+
+This file is kept for backward compatibility only and will be removed
+in a future version.
+==============================================================================
+
 Key improvements:
 1. Quality-based routing to different processing pipelines
 2. Hierarchical chunking with structure preservation
@@ -8,6 +22,13 @@ Key improvements:
 4. Table extraction and dual embedding
 5. Document relationship graph building
 """
+import warnings
+warnings.warn(
+    "EnhancedIngestionPipeline is deprecated. Use MasterPipeline from "
+    "src.pipeline.master_pipeline instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime
@@ -559,7 +580,7 @@ def create_enhanced_pipeline(
     qdrant_host: str = "localhost",
     qdrant_port: int = 6333,
     dense_model: str = "BAAI/bge-base-en-v1.5",
-    enable_colpali: bool = False,
+    enable_colpali: bool = True,
     enable_tables: bool = True,
     enable_graph: bool = True,
 ) -> EnhancedIngestionPipeline:

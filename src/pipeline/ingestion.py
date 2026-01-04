@@ -1,6 +1,15 @@
 """
 Main Ingestion Pipeline for document processing and indexing.
 
+==============================================================================
+DEPRECATED: Use MasterPipeline from src.pipeline.master_pipeline instead.
+
+    from src.pipeline import create_master_pipeline
+
+This file is kept for backward compatibility only and will be removed
+in a future version.
+==============================================================================
+
 Orchestrates the full flow:
 1. Document processing (Unstructured.io)
 2. Metadata storage (PostgreSQL)
@@ -10,6 +19,13 @@ Orchestrates the full flow:
 
 IMPORTANT: All operations require TenantContext for multi-tenant isolation.
 """
+import warnings
+warnings.warn(
+    "IngestionPipeline is deprecated. Use MasterPipeline from "
+    "src.pipeline.master_pipeline instead.",
+    DeprecationWarning,
+    stacklevel=2
+)
 from typing import List, Dict, Any, Optional
 from pathlib import Path
 from datetime import datetime

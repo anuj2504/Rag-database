@@ -482,8 +482,8 @@ QDRANT_PORT=6333
 # Embeddings
 DENSE_MODEL=BAAI/bge-base-en-v1.5
 
-# ColPali (requires GPU)
-ENABLE_COLPALI=false
+# ColPali (visual document understanding - enabled by default for image/table search)
+ENABLE_COLPALI=true
 ```
 
 ### Search Weights

@@ -176,12 +176,12 @@ async def lifespan(app: FastAPI):
     )
     qdrant_host = os.getenv("QDRANT_HOST", "localhost")
     qdrant_port = int(os.getenv("QDRANT_PORT", "6333"))
-    enable_colpali = os.getenv("ENABLE_COLPALI", "false").lower() == "true"
+    enable_colpali = os.getenv("ENABLE_COLPALI", "true").lower() == "true"
 
     try:
-        # Import and create pipeline
-        from src.pipeline.ingestion import create_pipeline
-        pipeline = create_pipeline(
+        # Import and create MasterPipeline (unified pipeline)
+        from src.pipeline import create_master_pipeline
+        pipeline = create_master_pipeline(
             postgres_url=postgres_url,
             qdrant_host=qdrant_host,
             qdrant_port=qdrant_port,
@@ -198,10 +198,12 @@ async def lifespan(app: FastAPI):
             colpali_embedder=pipeline.colpali_embedder,
         )
 
-        logger.info("RAG services initialized successfully")
+        logger.info("RAG services initialized successfully (MasterPipeline with ColPali enabled)")
 
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
+        import traceback
+        traceback.print_exc()
         # Allow startup but endpoints will return errors
 
     yield
@@ -445,12 +447,13 @@ async def upload_document(
             tmp_file.write(content)
             tmp_path = tmp_file.name
 
-        # Ingest document with tenant context
+        # Ingest document with tenant context using MasterPipeline
         custom_metadata = {}
         if document_type:
             custom_metadata["document_type_hint"] = document_type
 
-        result = pipeline.ingest_document(
+        # MasterPipeline uses ingest() method
+        result = pipeline.ingest(
             file_path=tmp_path,
             tenant_context=tenant,
             custom_metadata=custom_metadata
@@ -500,7 +503,8 @@ async def ingest_from_path(
         if document_type:
             custom_metadata["document_type_hint"] = document_type
 
-        result = pipeline.ingest_document(
+        # MasterPipeline uses ingest() method
+        result = pipeline.ingest(
             file_path=file_path,
             tenant_context=tenant,
             custom_metadata=custom_metadata

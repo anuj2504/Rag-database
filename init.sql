@@ -29,16 +29,43 @@ CREATE TYPE document_status AS ENUM (
 );
 
 CREATE TYPE document_type AS ENUM (
+    -- Legal/Contract Documents
     'contract',
+    'agreement',
+    'tender',
+    'amendment',
     'letter',
-    'invoice',
+    'legal',
+    -- Regulatory/Code Documents
+    'irc_code',
+    'building_code',
     'code',
+    'specification',
+    'standard',
+    -- Project Documents
+    'dpr',
+    'feasibility',
+    'estimate',
+    'boq',
+    -- Financial Documents
+    'financial_report',
+    'financial',
+    'invoice',
+    'budget',
+    -- Technical Documents
+    'drawing',
+    'manual',
+    'sop',
+    'technical',
     'report',
     'form',
     'document',
-    'financial',
-    'legal',
-    'technical',
+    -- Correspondence
+    'memo',
+    'circular',
+    -- General
+    'general',
+    'unknown',
     'other'
 );
 
