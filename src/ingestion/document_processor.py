@@ -8,6 +8,7 @@ import hashlib
 
 from unstructured.partition.auto import partition
 from unstructured.partition.pdf import partition_pdf
+from unstructured.partition.xlsx import partition_xlsx
 from unstructured.chunking.title import chunk_by_title
 from unstructured.documents.elements import Element
 from pdf2image import convert_from_path
@@ -73,6 +74,12 @@ class DocumentProcessor:
             return 'letter'
         if any(term in filename_lower for term in ['invoice', 'bill', 'receipt']):
             return 'invoice'
+        if any(term in filename_lower for term in ['boq', 'bill of quantities', 'quantity']):
+            return 'boq'
+        if any(term in filename_lower for term in ['schedule', 'timeline', 'gantt']):
+            return 'schedule'
+        if filename_lower.endswith(('.xlsx', '.xls')):
+            return 'spreadsheet'
         if filename_lower.endswith(('.py', '.js', '.ts', '.java', '.cpp', '.c')):
             return 'code'
 
@@ -133,6 +140,12 @@ class DocumentProcessor:
                 infer_table_structure=True,
                 languages=self.ocr_languages,
                 extract_images_in_pdf=False,  # We handle images separately for ColPali
+            )
+        elif file_path.lower().endswith(('.xlsx', '.xls')):
+            # Excel files - partition each sheet as tables
+            elements = partition_xlsx(
+                filename=file_path,
+                infer_table_structure=True,
             )
         else:
             elements = partition(
@@ -205,7 +218,7 @@ class DocumentProcessor:
     def process_directory(
         self,
         directory_path: str,
-        extensions: List[str] = ['.pdf', '.docx', '.txt', '.png', '.jpg']
+        extensions: List[str] = ['.pdf', '.docx', '.txt', '.png', '.jpg', '.xlsx', '.xls']
     ) -> List[ProcessedDocument]:
         """Process all documents in a directory."""
         documents = []
