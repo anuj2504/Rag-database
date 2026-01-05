@@ -63,6 +63,7 @@ class IngestionResult:
     chunks_created: int = 0
     chunks_indexed: int = 0
     pages_indexed: int = 0
+    visual_elements_indexed: int = 0  # NEW: Cropped tables/figures
     tables_extracted: int = 0
     relationships_found: int = 0
 
@@ -122,6 +123,7 @@ class MasterPipeline:
         metadata_store=None,
         dense_vector_store=None,
         colpali_vector_store=None,
+        visual_element_store=None,  # NEW: For cropped tables/figures
         bm25_store=None,
 
         # Enhanced components
@@ -134,6 +136,7 @@ class MasterPipeline:
         batch_size: int = 32,
         max_workers: int = 4,
         enable_colpali: bool = True,
+        enable_visual_elements: bool = True,  # NEW: Enable visual element embedding
         enable_tables: bool = True,
         enable_graph: bool = True,
     ):
@@ -147,7 +150,8 @@ class MasterPipeline:
             colpali_embedder: ColPali embedding model
             metadata_store: PostgreSQL metadata store
             dense_vector_store: Qdrant vector store
-            colpali_vector_store: Qdrant multi-vector store
+            colpali_vector_store: Qdrant multi-vector store for full pages
+            visual_element_store: Qdrant store for cropped tables/figures
             bm25_store: BM25 keyword index
             quality_analyzer: Document quality analyzer
             metadata_extractor: Domain-specific metadata extractor
@@ -155,7 +159,8 @@ class MasterPipeline:
             document_graph: Document relationship graph
             batch_size: Batch size for embedding
             max_workers: Max parallel workers
-            enable_colpali: Enable ColPali visual embeddings
+            enable_colpali: Enable ColPali visual embeddings (full pages)
+            enable_visual_elements: Enable visual element embedding (cropped tables/figures)
             enable_tables: Enable table extraction
             enable_graph: Enable document graph
         """
@@ -169,6 +174,7 @@ class MasterPipeline:
         self.metadata_store = metadata_store
         self.dense_vector_store = dense_vector_store
         self.colpali_vector_store = colpali_vector_store
+        self.visual_element_store = visual_element_store
         self.bm25_store = bm25_store
 
         # Enhanced components
@@ -181,6 +187,7 @@ class MasterPipeline:
         self.batch_size = batch_size
         self.max_workers = max_workers
         self.enable_colpali = enable_colpali and colpali_embedder is not None
+        self.enable_visual_elements = enable_visual_elements and visual_element_store is not None and colpali_embedder is not None
         self.enable_tables = enable_tables and table_extractor is not None
         self.enable_graph = enable_graph and document_graph is not None
 
@@ -350,13 +357,21 @@ class MasterPipeline:
             chunks_indexed = self._index_dense_embeddings(chunks)
             logger.info(f"  Indexed {chunks_indexed} chunks (dense)")
 
-            # ColPali embeddings
+            # ColPali embeddings (full pages)
             pages_indexed = 0
             if self.enable_colpali and processed_doc.page_images:
                 pages_indexed = self._index_colpali_embeddings(
                     processed_doc, tenant_context
                 )
                 logger.info(f"  Indexed {pages_indexed} pages (ColPali)")
+
+            # Visual element embeddings (cropped tables/figures)
+            visual_elements_indexed = 0
+            if self.enable_visual_elements and processed_doc.visual_elements:
+                visual_elements_indexed = self._index_visual_elements(
+                    processed_doc, tenant_context
+                )
+                logger.info(f"  Indexed {visual_elements_indexed} visual elements (ColPali)")
 
             # BM25 index
             if self.bm25_store:
@@ -383,6 +398,7 @@ class MasterPipeline:
             logger.info(
                 f"[COMPLETE] {filename}: "
                 f"{chunks_indexed} chunks, {pages_indexed} pages, "
+                f"{visual_elements_indexed} visual elements, "
                 f"{processing_time:.2f}s"
             )
 
@@ -397,6 +413,7 @@ class MasterPipeline:
                         "document_id": document_id,
                         "chunks_indexed": chunks_indexed,
                         "pages_indexed": pages_indexed,
+                        "visual_elements_indexed": visual_elements_indexed,
                         "tables_extracted": len(tables),
                         "processing_time_seconds": processing_time,
                     }
@@ -415,6 +432,7 @@ class MasterPipeline:
                 chunks_created=len(chunks),
                 chunks_indexed=chunks_indexed,
                 pages_indexed=pages_indexed,
+                visual_elements_indexed=visual_elements_indexed,
                 tables_extracted=len(tables),
                 relationships_found=relationships_found,
                 document_type=document_type,
@@ -607,6 +625,72 @@ class MasterPipeline:
 
         return len(page_embeddings)
 
+    def _index_visual_elements(
+        self,
+        processed_doc,
+        tenant_context: TenantContext,
+    ) -> int:
+        """
+        Create and store ColPali embeddings for visual elements (tables, figures).
+
+        Visual elements are cropped images extracted from the document.
+        They provide more precise retrieval than full-page embeddings for
+        queries targeting specific tables or figures.
+        """
+        if not self.visual_element_store or not processed_doc.visual_elements:
+            return 0
+
+        # Filter elements that have images
+        elements_with_images = [
+            elem for elem in processed_doc.visual_elements
+            if elem.image_base64 is not None
+        ]
+
+        if not elements_with_images:
+            logger.info("No visual elements with images to index")
+            return 0
+
+        # Decode images from base64
+        images = []
+        valid_elements = []
+        for elem in elements_with_images:
+            img = elem.decode_image()
+            if img is not None:
+                images.append(img)
+                valid_elements.append(elem)
+
+        if not images:
+            logger.warning("Failed to decode any visual element images")
+            return 0
+
+        # Create ColPali embeddings for cropped images
+        logger.info(f"Embedding {len(images)} visual elements with ColPali...")
+        element_embeddings = self.colpali_embedder.embed_images(images)
+
+        # Prepare data for storage
+        ids = []
+        payloads = []
+        for elem in valid_elements:
+            ids.append(elem.element_id)
+            payloads.append({
+                "document_id": elem.document_id,
+                "element_type": elem.element_type.value,
+                "page_number": elem.page_number,
+                "text_content": elem.text_content,
+                "html_content": elem.html_content,
+                "bbox": elem.bbox.to_dict() if elem.bbox else None,
+                "filename": processed_doc.filename,
+                "organization_id": tenant_context.organization_id,
+                "workspace_id": tenant_context.workspace_id,
+                "access_level": tenant_context.access_level.value if hasattr(tenant_context.access_level, 'value') else str(tenant_context.access_level),
+            })
+
+        # Store in visual elements collection
+        self.visual_element_store.add_elements(ids, element_embeddings, payloads)
+
+        logger.info(f"Indexed {len(element_embeddings)} visual elements")
+        return len(element_embeddings)
+
     def _index_bm25(self, chunks: List[UnifiedChunk]):
         """Index chunks in BM25."""
         if not self.bm25_store:
@@ -721,6 +805,9 @@ class MasterPipeline:
             if self.colpali_vector_store:
                 self.colpali_vector_store.delete_by_document_id(document_id)
 
+            if self.visual_element_store:
+                self.visual_element_store.delete_by_document_id(document_id)
+
             # Delete from BM25
             if self.bm25_store:
                 self.bm25_store.delete_by_document_id(document_id)
@@ -745,6 +832,7 @@ def create_master_pipeline(
     chunk_size: int = 512,
     chunk_overlap: int = 128,
     enable_colpali: bool = True,
+    enable_visual_elements: bool = True,
     enable_tables: bool = True,
     enable_graph: bool = True,
     bm25_persist_path: str = "./data/bm25_index.pkl",
@@ -761,7 +849,8 @@ def create_master_pipeline(
         dense_model: Dense embedding model name
         chunk_size: Target chunk size in tokens
         chunk_overlap: Overlap between chunks
-        enable_colpali: Enable ColPali visual embeddings
+        enable_colpali: Enable ColPali visual embeddings (full pages)
+        enable_visual_elements: Enable visual element embedding (cropped tables/figures)
         enable_tables: Enable table extraction
         enable_graph: Enable document relationship graph
         bm25_persist_path: Path to persist BM25 index
@@ -772,7 +861,7 @@ def create_master_pipeline(
     from src.ingestion.document_processor import DocumentProcessor
     from src.embeddings.dense_embedder import get_embedder
     from src.storage.metadata_store import MetadataStore
-    from src.storage.vector_store import QdrantVectorStore, QdrantMultiVectorStore
+    from src.storage.vector_store import QdrantVectorStore, QdrantMultiVectorStore, QdrantVisualElementStore
     from src.storage.bm25_store import BM25Index
     from src.chunking.chunking_service import ChunkingService
 
@@ -781,6 +870,7 @@ def create_master_pipeline(
         chunk_size=chunk_size,
         chunk_overlap=50,
         extract_images=enable_colpali,
+        extract_visual_elements=enable_visual_elements,
     )
 
     # Chunking service
@@ -817,6 +907,16 @@ def create_master_pipeline(
     if colpali_embedder:
         colpali_vector_store = QdrantMultiVectorStore(
             collection_name="nhai_lt_colpali",
+            dimension=128,
+            host=qdrant_host,
+            port=qdrant_port,
+        )
+
+    # Visual element store (for cropped tables/figures)
+    visual_element_store = None
+    if colpali_embedder and enable_visual_elements:
+        visual_element_store = QdrantVisualElementStore(
+            collection_name="nhai_lt_visual_elements",
             dimension=128,
             host=qdrant_host,
             port=qdrant_port,
@@ -865,12 +965,14 @@ def create_master_pipeline(
         metadata_store=metadata_store,
         dense_vector_store=dense_vector_store,
         colpali_vector_store=colpali_vector_store,
+        visual_element_store=visual_element_store,
         bm25_store=bm25_store,
         quality_analyzer=quality_analyzer,
         metadata_extractor=metadata_extractor,
         table_extractor=table_extractor,
         document_graph=document_graph,
         enable_colpali=enable_colpali,
+        enable_visual_elements=enable_visual_elements,
         enable_tables=enable_tables,
         enable_graph=enable_graph,
     )

@@ -538,6 +538,278 @@ class QdrantMultiVectorStore:
             )
         )
 
+    def get_collection_info(self) -> Dict[str, Any]:
+        """Get collection statistics."""
+        info = self.client.get_collection(self.collection_name)
+        vectors_count = getattr(info, 'vectors_count', None) or getattr(info, 'indexed_vectors_count', 0)
+        points_count = getattr(info, 'points_count', 0)
+        status = getattr(info, 'status', 'unknown')
+        return {
+            "name": self.collection_name,
+            "vectors_count": vectors_count,
+            "points_count": points_count,
+            "status": str(status),
+            "dimension": self.dimension,
+        }
+
+
+class QdrantVisualElementStore:
+    """
+    Qdrant store for visual elements (tables, figures, charts) with ColPali embeddings.
+
+    This is separate from the full-page ColPali store because:
+    1. Visual elements are cropped/focused, providing better retrieval precision
+    2. Element-level filtering (search only tables, only figures)
+    3. Smaller embeddings per element vs full pages
+
+    Based on ColPALI Meets DocLayNet approach.
+    """
+
+    def __init__(
+        self,
+        collection_name: str = "visual_elements",
+        dimension: int = 128,  # ColPali embedding dimension
+        host: str = "localhost",
+        port: int = 6333,
+        api_key: Optional[str] = None,
+        url: Optional[str] = None,
+    ):
+        """
+        Initialize visual element store.
+
+        Args:
+            collection_name: Name of the Qdrant collection
+            dimension: Embedding dimension (128 for ColPali)
+            host: Qdrant host
+            port: Qdrant port
+            api_key: Optional API key
+            url: Optional full URL (overrides host/port)
+        """
+        self.collection_name = collection_name
+        self.dimension = dimension
+
+        if url:
+            self.client = QdrantClient(url=url, api_key=api_key)
+        else:
+            self.client = QdrantClient(host=host, port=port, api_key=api_key)
+
+        self._ensure_collection()
+
+    def _ensure_collection(self):
+        """Create collection for visual element multi-vector storage."""
+        collections = self.client.get_collections().collections
+        exists = any(c.name == self.collection_name for c in collections)
+
+        if not exists:
+            logger.info(f"Creating visual elements collection: {self.collection_name}")
+
+            # Use multivector configuration (same as ColPali pages)
+            self.client.create_collection(
+                collection_name=self.collection_name,
+                vectors_config={
+                    "patches": VectorParams(
+                        size=self.dimension,
+                        distance=Distance.DOT,  # ColPali uses dot product
+                        multivector_config=models.MultiVectorConfig(
+                            comparator=models.MultiVectorComparator.MAX_SIM
+                        )
+                    )
+                },
+                hnsw_config=HnswConfigDiff(
+                    m=16,
+                    ef_construct=100,
+                ),
+            )
+
+            # Create payload indexes for filtering
+            self._create_payload_indexes()
+
+    def _create_payload_indexes(self):
+        """Create indexes for element-type filtering."""
+        index_fields = [
+            ("document_id", models.PayloadSchemaType.KEYWORD),
+            ("element_type", models.PayloadSchemaType.KEYWORD),  # Table, Image, Figure
+            ("page_number", models.PayloadSchemaType.INTEGER),
+            ("organization_id", models.PayloadSchemaType.KEYWORD),  # Multi-tenant
+        ]
+
+        for field_name, field_type in index_fields:
+            try:
+                self.client.create_payload_index(
+                    collection_name=self.collection_name,
+                    field_name=field_name,
+                    field_schema=field_type,
+                )
+            except Exception:
+                pass
+
+    def _string_to_uuid(self, string_id: str) -> str:
+        """Convert a string ID to a deterministic UUID for Qdrant."""
+        hash_bytes = hashlib.md5(string_id.encode()).digest()
+        return str(uuid.UUID(bytes=hash_bytes))
+
+    def add_elements(
+        self,
+        ids: List[str],
+        embeddings: List[np.ndarray],
+        payloads: List[Dict[str, Any]],
+        batch_size: int = 10  # Can be larger than pages since elements are smaller
+    ) -> None:
+        """
+        Add visual element embeddings.
+
+        Visual elements (cropped tables/figures) generate fewer patches than full pages,
+        so we can use larger batch sizes.
+
+        Args:
+            ids: Element IDs
+            embeddings: List of arrays, each (num_patches, 128)
+            payloads: Metadata including element_type, page_number, bbox, etc.
+            batch_size: Number of elements per batch
+        """
+        for i in range(0, len(ids), batch_size):
+            batch_ids = ids[i:i + batch_size]
+            batch_embeddings = embeddings[i:i + batch_size]
+            batch_payloads = payloads[i:i + batch_size]
+
+            points = []
+            for element_id, emb, payload in zip(batch_ids, batch_embeddings, batch_payloads):
+                qdrant_id = self._string_to_uuid(element_id)
+                payload["original_id"] = element_id
+                points.append(
+                    PointStruct(
+                        id=qdrant_id,
+                        vector={"patches": emb.tolist()},
+                        payload=payload
+                    )
+                )
+
+            self.client.upsert(
+                collection_name=self.collection_name,
+                points=points,
+                wait=True
+            )
+
+        logger.info(f"Added {len(ids)} visual elements to {self.collection_name}")
+
+    def search(
+        self,
+        query_embedding: np.ndarray,
+        limit: int = 10,
+        element_types: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[SearchResult]:
+        """
+        Search visual elements using MaxSim.
+
+        Args:
+            query_embedding: Query vectors (num_tokens, 128)
+            limit: Number of results
+            element_types: Filter by element types (e.g., ["Table", "Image"])
+            filters: Additional payload filters
+
+        Returns:
+            List of SearchResult with MaxSim scores
+        """
+        conditions = []
+
+        # Add element type filter
+        if element_types:
+            conditions.append(
+                FieldCondition(key="element_type", match=MatchAny(any=element_types))
+            )
+
+        # Add other filters
+        if filters:
+            for key, value in filters.items():
+                if isinstance(value, list):
+                    conditions.append(
+                        FieldCondition(key=key, match=MatchAny(any=value))
+                    )
+                else:
+                    conditions.append(
+                        FieldCondition(key=key, match=MatchValue(value=value))
+                    )
+
+        qdrant_filter = Filter(must=conditions) if conditions else None
+
+        results = self.client.query_points(
+            collection_name=self.collection_name,
+            query=query_embedding.tolist(),
+            using="patches",
+            limit=limit,
+            query_filter=qdrant_filter,
+            with_payload=True,
+        )
+
+        return [
+            SearchResult(
+                id=str(r.id),
+                score=r.score,
+                payload=r.payload or {}
+            )
+            for r in results.points
+        ]
+
+    def search_tables(
+        self,
+        query_embedding: np.ndarray,
+        limit: int = 5,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[SearchResult]:
+        """Convenience method to search only tables."""
+        return self.search(
+            query_embedding=query_embedding,
+            limit=limit,
+            element_types=["Table"],
+            filters=filters
+        )
+
+    def search_figures(
+        self,
+        query_embedding: np.ndarray,
+        limit: int = 5,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[SearchResult]:
+        """Convenience method to search only figures/images."""
+        return self.search(
+            query_embedding=query_embedding,
+            limit=limit,
+            element_types=["Image", "Figure"],
+            filters=filters
+        )
+
+    def delete_by_document_id(self, document_id: str) -> None:
+        """Delete all visual elements for a document."""
+        self.client.delete(
+            collection_name=self.collection_name,
+            points_selector=models.FilterSelector(
+                filter=Filter(
+                    must=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(value=document_id)
+                        )
+                    ]
+                )
+            )
+        )
+        logger.info(f"Deleted visual elements for document: {document_id}")
+
+    def get_collection_info(self) -> Dict[str, Any]:
+        """Get collection statistics."""
+        info = self.client.get_collection(self.collection_name)
+        vectors_count = getattr(info, 'vectors_count', None) or getattr(info, 'indexed_vectors_count', 0)
+        points_count = getattr(info, 'points_count', 0)
+        status = getattr(info, 'status', 'unknown')
+        return {
+            "name": self.collection_name,
+            "vectors_count": vectors_count,
+            "points_count": points_count,
+            "status": str(status),
+            "dimension": self.dimension,
+        }
+
 
 # Example usage
 if __name__ == "__main__":

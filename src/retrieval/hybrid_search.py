@@ -4,7 +4,11 @@ Hybrid Search combining BM25, Dense, and ColPali retrieval.
 Uses Reciprocal Rank Fusion (RRF) to combine results from multiple
 retrieval methods, providing the best of both keyword and semantic search.
 """
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.retrieval.query_analyzer import QueryModalityDetector
+    from src.storage.vector_store import QdrantVisualElementStore
 from dataclasses import dataclass, field
 from enum import Enum
 import numpy as np
@@ -104,14 +108,20 @@ class ReciprocalRankFusion:
 
 class HybridSearcher:
     """
-    Hybrid search combining multiple retrieval methods.
+    Hybrid search combining multiple retrieval methods with dynamic weight routing.
 
     Supports:
     - BM25 (keyword)
     - Dense embeddings (semantic)
-    - ColPali (visual)
+    - ColPali (visual - full pages)
+    - Visual Elements (tables, figures - cropped)
 
-    Uses RRF for result fusion.
+    Features:
+    - Uses RRF for result fusion
+    - Dynamic weight adjustment based on query modality
+    - Visual element search for queries targeting tables/figures
+
+    Based on ColPALI Meets DocLayNet architecture.
     """
 
     def __init__(
@@ -119,37 +129,74 @@ class HybridSearcher:
         bm25_store=None,
         dense_store=None,
         colpali_store=None,
+        visual_element_store=None,  # NEW: For cropped tables/figures
         dense_embedder=None,
         colpali_embedder=None,
+        query_analyzer=None,  # NEW: For dynamic weight routing
         rrf_k: int = 60,
-        default_weights: Optional[Dict[str, float]] = None
+        default_weights: Optional[Dict[str, float]] = None,
+        enable_dynamic_weights: bool = True,  # NEW: Enable/disable dynamic routing
     ):
         """
-        Initialize hybrid searcher.
+        Initialize hybrid searcher with visual element support.
 
         Args:
             bm25_store: BM25Index instance
             dense_store: QdrantVectorStore for dense embeddings
-            colpali_store: QdrantMultiVectorStore for ColPali
+            colpali_store: QdrantMultiVectorStore for ColPali (full pages)
+            visual_element_store: QdrantVisualElementStore for tables/figures
             dense_embedder: Dense embedding model
             colpali_embedder: ColPali embedding model
+            query_analyzer: QueryModalityDetector for dynamic weights
             rrf_k: RRF constant
             default_weights: Default weights for each method
+            enable_dynamic_weights: Whether to use query-based weight adjustment
         """
         self.bm25_store = bm25_store
         self.dense_store = dense_store
         self.colpali_store = colpali_store
+        self.visual_element_store = visual_element_store
         self.dense_embedder = dense_embedder
         self.colpali_embedder = colpali_embedder
+        self.query_analyzer = query_analyzer
+        self.enable_dynamic_weights = enable_dynamic_weights
 
         self.rrf = ReciprocalRankFusion(k=rrf_k)
 
-        # Default weights (can be tuned based on your data)
+        # Default weights (used when dynamic routing is disabled or no analyzer)
         self.default_weights = default_weights or {
             RetrievalMethod.BM25.value: 0.3,
             RetrievalMethod.DENSE.value: 0.5,
             RetrievalMethod.COLPALI.value: 0.2,
         }
+
+    def _get_weights_for_query(self, query: str, custom_weights: Optional[Dict[str, float]] = None) -> Dict[str, float]:
+        """
+        Get weights for a query, optionally using dynamic routing.
+
+        Args:
+            query: Search query
+            custom_weights: Override weights (skip dynamic routing)
+
+        Returns:
+            Dict with bm25, dense, colpali weights
+        """
+        # Custom weights take precedence
+        if custom_weights is not None:
+            return custom_weights
+
+        # Use dynamic routing if enabled and analyzer available
+        if self.enable_dynamic_weights and self.query_analyzer:
+            analysis = self.query_analyzer.analyze(query)
+            logger.info(
+                f"Query analysis: modality={analysis.modality.value}, "
+                f"visual_score={analysis.visual_score:.2f}, "
+                f"weights={analysis.suggested_weights}"
+            )
+            return analysis.suggested_weights
+
+        # Fall back to default weights
+        return self.default_weights
 
     def search(
         self,
@@ -262,8 +309,10 @@ class HybridSearcher:
                 all_results_by_id[doc_id]["colpali_score"] = r.score
                 all_results_by_id[doc_id]["colpali_rank"] = rank
 
+        # Get weights (dynamic or custom)
+        use_weights = self._get_weights_for_query(query, weights)
+
         # Fuse results using RRF
-        use_weights = weights or self.default_weights
         fused_results = self.rrf.fuse(ranked_lists, use_weights)
 
         # Log fusion stats
@@ -335,6 +384,107 @@ class HybridSearcher:
             methods=[RetrievalMethod.COLPALI],
             filters=filters
         )
+
+    def search_visual_elements(
+        self,
+        query: str,
+        limit: int = 10,
+        element_types: Optional[List[str]] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[HybridResult]:
+        """
+        Search visual elements (tables, figures) directly.
+
+        This searches the visual_elements collection for cropped tables/figures,
+        which is more precise than full-page ColPali search for visual queries.
+
+        Args:
+            query: Search query
+            limit: Number of results
+            element_types: Filter by element types (e.g., ["Table", "Image"])
+            filters: Additional payload filters
+
+        Returns:
+            List of HybridResult with visual element matches
+        """
+        if not self.visual_element_store or not self.colpali_embedder:
+            logger.warning("Visual element search requires visual_element_store and colpali_embedder")
+            return []
+
+        # Embed query with ColPali
+        query_embedding = self.colpali_embedder.embed_query(query)
+
+        # Search visual elements collection
+        results = self.visual_element_store.search(
+            query_embedding=query_embedding,
+            limit=limit,
+            element_types=element_types,
+            filters=filters
+        )
+
+        # Convert to HybridResult
+        hybrid_results = []
+        for r in results:
+            hybrid_results.append(HybridResult(
+                id=r.payload.get("original_id", r.id),
+                final_score=r.score,
+                text=r.payload.get("text_content"),
+                metadata=r.payload,
+                colpali_score=r.score,
+                colpali_rank=None,  # Not part of ranked fusion
+            ))
+
+        return hybrid_results
+
+    def search_with_visual_elements(
+        self,
+        query: str,
+        limit: int = 10,
+        filters: Optional[Dict[str, Any]] = None,
+        include_text: bool = True
+    ) -> Tuple[List[HybridResult], List[HybridResult]]:
+        """
+        Search with automatic visual element detection.
+
+        If the query targets visual content (tables, figures), also searches
+        the visual_elements collection and returns both result sets.
+
+        Args:
+            query: Search query
+            limit: Number of results
+            filters: Metadata filters
+            include_text: Whether to include text in results
+
+        Returns:
+            Tuple of (hybrid_results, visual_element_results)
+        """
+        # Always run hybrid search
+        hybrid_results = self.search(
+            query=query,
+            limit=limit,
+            filters=filters,
+            include_text=include_text
+        )
+
+        # Check if we should also search visual elements
+        visual_element_results = []
+        if self.query_analyzer and self.visual_element_store:
+            analysis = self.query_analyzer.analyze(query)
+            if analysis.should_search_visual_elements():
+                # Get target element types from query
+                element_types = self.query_analyzer.get_target_element_types(query)
+                visual_element_results = self.search_visual_elements(
+                    query=query,
+                    limit=limit // 2,  # Half the limit for visual elements
+                    element_types=element_types,
+                    filters=filters
+                )
+                logger.info(
+                    f"Visual element search: found {len(visual_element_results)} elements "
+                    f"(types={element_types})"
+                )
+
+        return hybrid_results, visual_element_results
 
 
 class CrossEncoderReranker:

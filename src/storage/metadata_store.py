@@ -682,7 +682,10 @@ class MetadataStore:
         created_by: Optional[str] = None,
         metadata: Optional[Dict] = None
     ) -> Document:
-        """Create a new document record with tenant isolation."""
+        """Create a new document record with tenant isolation.
+
+        If document with same ID exists, it will be updated (upsert behavior).
+        """
         # Auto-create organization if it doesn't exist
         self.ensure_organization(organization_id)
 
@@ -691,6 +694,29 @@ class MetadataStore:
             self.ensure_workspace(workspace_id, organization_id)
 
         with self.get_session() as session:
+            # Check if document already exists
+            existing = session.query(Document).filter(Document.id == document_id).first()
+            if existing:
+                # Update existing document
+                logger.info(f"Document {document_id} already exists, updating...")
+                existing.filename = filename
+                existing.file_path = file_path
+                existing.document_type = DocumentType(document_type)
+                existing.status = DocumentStatus.PENDING
+                existing.organization_id = organization_id
+                existing.workspace_id = workspace_id
+                existing.collection_id = collection_id
+                existing.access_level = access_level
+                existing.owner_id = owner_id
+                existing.created_by = created_by
+                existing._metadata = metadata or {}
+                existing.updated_at = datetime.utcnow()
+                session.flush()
+                session.refresh(existing)
+                session.expunge(existing)
+                return existing
+
+            # Create new document
             doc = Document(
                 id=document_id,
                 filename=filename,
@@ -707,12 +733,18 @@ class MetadataStore:
             )
             session.add(doc)
             session.flush()
+            session.refresh(doc)
+            session.expunge(doc)
             return doc
 
     def get_document(self, document_id: str) -> Optional[Document]:
         """Get document by ID."""
         with self.get_session() as session:
-            return session.query(Document).filter(Document.id == document_id).first()
+            doc = session.query(Document).filter(Document.id == document_id).first()
+            if doc:
+                session.refresh(doc)
+                session.expunge(doc)
+            return doc
 
     def update_document(
         self,
@@ -730,6 +762,9 @@ class MetadataStore:
                         value = DocumentType(value)
                     setattr(doc, key, value)
                 doc.updated_at = datetime.utcnow()
+                session.flush()
+                session.refresh(doc)
+                session.expunge(doc)
             return doc
 
     def delete_document(self, document_id: str) -> bool:
@@ -762,8 +797,34 @@ class MetadataStore:
 
     # Chunk operations
     def create_chunks(self, chunks: List[Dict[str, Any]]) -> List[Chunk]:
-        """Bulk create chunks with tenant isolation."""
+        """Bulk create chunks with tenant isolation.
+
+        If chunks for the same document already exist, they are deleted first
+        to support re-processing of documents.
+        """
+        if not chunks:
+            return []
+
         with self.get_session() as session:
+            # Get unique document_ids from chunks to be inserted
+            document_ids = set(chunk_data["document_id"] for chunk_data in chunks)
+
+            # Delete existing chunks for these documents (supports re-upload)
+            total_deleted = 0
+            for doc_id in document_ids:
+                existing_count = session.query(Chunk).filter(
+                    Chunk.document_id == doc_id
+                ).delete(synchronize_session=False)
+                if existing_count > 0:
+                    logger.info(f"Deleted {existing_count} existing chunks for document {doc_id}")
+                    total_deleted += existing_count
+
+            # Flush the deletes before inserting to avoid constraint violations
+            if total_deleted > 0:
+                session.flush()
+                logger.info(f"Flushed deletion of {total_deleted} chunks before insert")
+
+            # Now insert new chunks
             chunk_records = []
             for chunk_data in chunks:
                 chunk = Chunk(
@@ -788,14 +849,20 @@ class MetadataStore:
     def get_chunks_by_document(self, document_id: str) -> List[Chunk]:
         """Get all chunks for a document."""
         with self.get_session() as session:
-            return session.query(Chunk).filter(
+            chunks = session.query(Chunk).filter(
                 Chunk.document_id == document_id
             ).order_by(Chunk.chunk_index).all()
+            for chunk in chunks:
+                session.expunge(chunk)
+            return chunks
 
     def get_chunks_by_ids(self, chunk_ids: List[str]) -> List[Chunk]:
         """Get chunks by their IDs."""
         with self.get_session() as session:
-            return session.query(Chunk).filter(Chunk.id.in_(chunk_ids)).all()
+            chunks = session.query(Chunk).filter(Chunk.id.in_(chunk_ids)).all()
+            for chunk in chunks:
+                session.expunge(chunk)
+            return chunks
 
     def mark_chunks_indexed(self, chunk_ids: List[str]) -> None:
         """Mark chunks as indexed in vector store."""
@@ -807,8 +874,32 @@ class MetadataStore:
 
     # Page operations
     def create_pages(self, pages: List[Dict[str, Any]]) -> List[Page]:
-        """Bulk create page records with tenant isolation."""
+        """Bulk create page records with tenant isolation.
+
+        If pages for the same document already exist, they are deleted first.
+        """
+        if not pages:
+            return []
+
         with self.get_session() as session:
+            # Get unique document_ids from pages to be inserted
+            document_ids = set(page_data["document_id"] for page_data in pages)
+
+            # Delete existing pages for these documents (supports re-upload)
+            total_deleted = 0
+            for doc_id in document_ids:
+                existing_count = session.query(Page).filter(
+                    Page.document_id == doc_id
+                ).delete(synchronize_session=False)
+                if existing_count > 0:
+                    logger.info(f"Deleted {existing_count} existing pages for document {doc_id}")
+                    total_deleted += existing_count
+
+            # Flush the deletes before inserting
+            if total_deleted > 0:
+                session.flush()
+
+            # Now insert new pages
             page_records = []
             for page_data in pages:
                 page = Page(
@@ -865,6 +956,10 @@ class MetadataStore:
             )
             session.add(job)
             session.flush()
+            # Eagerly load all attributes before session closes to avoid DetachedInstanceError
+            session.refresh(job)
+            # Expunge so the object is detached but with all attributes loaded
+            session.expunge(job)
             return job
 
     def update_processing_job(
@@ -897,6 +992,9 @@ class MetadataStore:
                     job.error_details = error_details
                 if result_summary:
                     job.result_summary = result_summary
+                session.flush()
+                session.refresh(job)
+                session.expunge(job)
             return job
 
     def get_processing_jobs(
@@ -937,8 +1035,19 @@ class MetadataStore:
         recommendations: Optional[List] = None,
         recommended_pipeline: Optional[str] = None,
     ) -> QualityReport:
-        """Create a quality report for a document."""
+        """Create a quality report for a document.
+
+        If a quality report already exists for this document, it will be deleted
+        first to support re-processing.
+        """
         with self.get_session() as session:
+            # Delete existing quality reports for this document (supports re-upload)
+            existing_count = session.query(QualityReport).filter(
+                QualityReport.document_id == document_id
+            ).delete(synchronize_session=False)
+            if existing_count > 0:
+                logger.info(f"Deleted {existing_count} existing quality report(s) for document {document_id}")
+
             report = QualityReport(
                 document_id=document_id,
                 organization_id=organization_id,
@@ -954,14 +1063,20 @@ class MetadataStore:
             )
             session.add(report)
             session.flush()
+            session.refresh(report)
+            session.expunge(report)
             return report
 
     def get_quality_report(self, document_id: str) -> Optional[QualityReport]:
         """Get quality report for a document."""
         with self.get_session() as session:
-            return session.query(QualityReport).filter(
+            report = session.query(QualityReport).filter(
                 QualityReport.document_id == document_id
             ).order_by(QualityReport.created_at.desc()).first()
+            if report:
+                session.refresh(report)
+                session.expunge(report)
+            return report
 
     def get_quality_reports_by_level(
         self,

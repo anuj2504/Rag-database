@@ -578,15 +578,17 @@ class ChunkingService:
                 try:
                     chonkie_chunks = chunker.chunk(text)
 
-                    for i, cc in enumerate(chonkie_chunks):
+                    kept_count = 0  # Track actual kept chunks to avoid ID collisions
+                    for cc in chonkie_chunks:
                         if cc.token_count < self.min_chunk_size:
                             continue
 
+                        chunk_idx = start_index + kept_count
                         chunk = UnifiedChunk(
-                            id=f"{document_id}_chunk_{start_index + i}",
+                            id=f"{document_id}_chunk_{chunk_idx}",
                             document_id=document_id,
                             text=cc.text,
-                            chunk_index=start_index + i,
+                            chunk_index=chunk_idx,
                             char_start=char_offset + (cc.start_index if hasattr(cc, 'start_index') else 0),
                             char_end=char_offset + (cc.end_index if hasattr(cc, 'end_index') else len(cc.text)),
                             token_count=cc.token_count,
@@ -605,6 +607,7 @@ class ChunkingService:
                             metadata=custom_metadata or {},
                         )
                         chunks.append(chunk)
+                        kept_count += 1
 
                     return chunks
 
