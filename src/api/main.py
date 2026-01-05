@@ -10,9 +10,12 @@ Provides REST API endpoints for:
 
 IMPORTANT: All endpoints require X-Organization-ID header for tenant isolation.
 """
+import os
+# Disable tokenizer parallelism to avoid fork warnings with HuggingFace
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
 from typing import List, Dict, Any, Optional
 from pathlib import Path
-import os
 import tempfile
 import logging
 from contextlib import asynccontextmanager
@@ -107,8 +110,13 @@ class SearchResult(BaseModel):
     text: Optional[str] = None
     metadata: Dict[str, Any] = {}
     bm25_rank: Optional[int] = None
+    bm25_score: Optional[float] = None
     dense_rank: Optional[int] = None
+    dense_score: Optional[float] = None
     colpali_rank: Optional[int] = None
+    colpali_score: Optional[float] = None
+    colpali_page_match: bool = False  # True if ColPali score from same page
+    colpali_doc_match: bool = False   # True if ColPali score from same document
 
 
 class SearchResponse(BaseModel):
@@ -188,17 +196,59 @@ async def lifespan(app: FastAPI):
             enable_colpali=enable_colpali
         )
 
-        # Create hybrid searcher
+        # Log component status for debugging
+        logger.info(f"Pipeline components status:")
+        logger.info(f"  - BM25 store: {'✓' if pipeline.bm25_store else '✗'}")
+        logger.info(f"  - Dense store: {'✓' if pipeline.dense_vector_store else '✗'}")
+        logger.info(f"  - Dense embedder: {'✓' if pipeline.dense_embedder else '✗'}")
+        logger.info(f"  - ColPali store: {'✓' if pipeline.colpali_vector_store else '✗'}")
+        logger.info(f"  - ColPali embedder: {'✓' if pipeline.colpali_embedder else '✗'}")
+
+        # If ColPali embedder failed to load in pipeline, try loading it separately
+        colpali_embedder = pipeline.colpali_embedder
+        colpali_store = pipeline.colpali_vector_store
+
+        if enable_colpali and not colpali_embedder:
+            logger.warning("ColPali embedder not loaded by pipeline, attempting separate load...")
+            try:
+                from src.embeddings.colpali_embedder import ColPaliEmbedder
+                colpali_embedder = ColPaliEmbedder()
+                logger.info("✓ ColPali embedder loaded separately")
+
+                # Also create the store if embedder loaded successfully
+                if not colpali_store:
+                    from src.storage.vector_store import QdrantMultiVectorStore
+                    colpali_store = QdrantMultiVectorStore(
+                        collection_name="nhai_lt_colpali",
+                        dimension=128,
+                        host=qdrant_host,
+                        port=qdrant_port,
+                    )
+                    logger.info("✓ ColPali store created separately")
+            except Exception as e:
+                logger.warning(f"ColPali separate load failed: {e}")
+
+        # Create hybrid searcher with all available components
         from src.retrieval.hybrid_search import HybridSearcher
         hybrid_searcher = HybridSearcher(
             bm25_store=pipeline.bm25_store,
             dense_store=pipeline.dense_vector_store,
-            colpali_store=pipeline.colpali_vector_store,
+            colpali_store=colpali_store,
             dense_embedder=pipeline.dense_embedder,
-            colpali_embedder=pipeline.colpali_embedder,
+            colpali_embedder=colpali_embedder,
         )
 
-        logger.info("RAG services initialized successfully (MasterPipeline with ColPali enabled)")
+        # Log final search capabilities
+        search_methods = []
+        if pipeline.bm25_store:
+            search_methods.append("BM25")
+        if pipeline.dense_vector_store and pipeline.dense_embedder:
+            search_methods.append("Dense")
+        if colpali_store and colpali_embedder:
+            search_methods.append("ColPali")
+
+        logger.info(f"RAG services initialized successfully!")
+        logger.info(f"Available search methods: {', '.join(search_methods)}")
 
     except Exception as e:
         logger.error(f"Failed to initialize services: {e}")
@@ -376,8 +426,13 @@ async def search(
                 text=r.text,
                 metadata=r.metadata,
                 bm25_rank=r.bm25_rank,
+                bm25_score=r.bm25_score,
                 dense_rank=r.dense_rank,
-                colpali_rank=r.colpali_rank
+                dense_score=r.dense_score,
+                colpali_rank=r.colpali_rank,
+                colpali_score=r.colpali_score,
+                colpali_page_match=r.colpali_page_match,
+                colpali_doc_match=r.colpali_doc_match,
             )
             for r in results
         ]

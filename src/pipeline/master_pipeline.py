@@ -321,6 +321,10 @@ class MasterPipeline:
                 f"  Created {len(chunks)} chunks using {chunking_result.chunk_strategy} strategy"
             )
 
+            # Assign accurate page numbers to chunks from original parsed elements
+            # This is critical for ColPali page-to-chunk score propagation
+            self._assign_page_numbers_to_chunks(chunks, processed_doc.chunks, full_text)
+
             # ========== STAGE 5: TABLE EXTRACTION ==========
             tables = []
             if self.enable_tables:
@@ -703,6 +707,68 @@ class MasterPipeline:
         ]
         self.bm25_store.add_documents(documents)
 
+    def _assign_page_numbers_to_chunks(
+        self,
+        chunks: List[UnifiedChunk],
+        original_elements,
+        full_text: str
+    ) -> None:
+        """
+        Accurately assign page numbers to chunks based on original parsed elements.
+
+        This is critical for ColPali page-to-chunk score propagation.
+        Uses binary search for O(n log m) efficiency.
+
+        Args:
+            chunks: New chunks from ChunkingService (missing page_number)
+            original_elements: Original ProcessedChunk list from document_processor
+            full_text: The full concatenated text used for chunking
+        """
+        import bisect
+
+        # Build character position -> page number mapping
+        # Each entry is (cumulative_char_position, page_number)
+        page_boundaries = []
+        cumulative_pos = 0
+
+        for elem in original_elements:
+            page_num = getattr(elem, 'page_number', None)
+            if page_num is not None:
+                # Record the start position of this element and its page
+                page_boundaries.append((cumulative_pos, page_num))
+            # Add element text length + newline separator
+            elem_text = getattr(elem, 'text', '')
+            cumulative_pos += len(elem_text) + 1  # +1 for '\n' separator
+
+        if not page_boundaries:
+            logger.warning("No page information available from parsed elements")
+            return
+
+        # Sort by position (should already be sorted, but ensure it)
+        page_boundaries.sort(key=lambda x: x[0])
+
+        # Extract just positions for binary search
+        positions = [pb[0] for pb in page_boundaries]
+
+        # Assign page numbers to each chunk
+        assigned_count = 0
+        for chunk in chunks:
+            # Find the chunk's position in the full text
+            chunk_start = chunk.char_start
+
+            # Binary search: find rightmost boundary <= chunk_start
+            idx = bisect.bisect_right(positions, chunk_start) - 1
+
+            if idx >= 0:
+                _, page_num = page_boundaries[idx]
+                chunk.page_number = page_num
+                assigned_count += 1
+
+        logger.info(
+            f"Assigned page numbers to {assigned_count}/{len(chunks)} chunks "
+            f"using {len(page_boundaries)} page boundaries"
+        )
+
     def ingest_batch(
         self,
         file_paths: List[str],
@@ -887,9 +953,15 @@ def create_master_pipeline(
     if enable_colpali:
         try:
             from src.embeddings.colpali_embedder import ColPaliEmbedder
+            logger.info("Loading ColPali embedder...")
             colpali_embedder = ColPaliEmbedder()
+            logger.info(f"ColPali embedder loaded successfully (dimension={colpali_embedder.dimension})")
+        except ImportError as e:
+            logger.warning(f"ColPali not available - missing dependencies: {e}")
         except Exception as e:
-            logger.warning(f"ColPali not available: {e}")
+            logger.warning(f"ColPali failed to load: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
 
     # Metadata store (PostgreSQL)
     metadata_store = MetadataStore(postgres_url)

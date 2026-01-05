@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 import hashlib
+import multiprocessing
 
 from unstructured.partition.auto import partition
 from unstructured.partition.pdf import partition_pdf
@@ -328,21 +329,43 @@ class DocumentProcessor:
         logger.info(f"Processing document: {filename} (ID: {document_id})")
 
         # Use Unstructured.io to partition the document with full features
+        # Check for fast parsing mode (for testing/development)
+        import os
+        parsing_strategy = os.getenv("PARSING_STRATEGY", "hi_res")
+        logger.info(f"Using parsing strategy: {parsing_strategy}")
+
         if file_path.lower().endswith('.pdf'):
-            elements = partition_pdf(
-                filename=file_path,
-                strategy="hi_res",
-                hi_res_model_name=self.hi_res_model,  # Use YOLOX for better layout detection
-                infer_table_structure=True,
-                languages=self.ocr_languages,
-                include_page_breaks=True,  # Better page tracking
-                # Extract visual elements as images
-                extract_image_block_types=self.VISUAL_ELEMENT_TYPES if self.extract_visual_elements else None,
-                extract_image_block_to_payload=self.extract_visual_elements,  # Base64 in metadata
-                # Optional features
-                detect_language_per_element=self.detect_language_per_element,
-                extract_forms=self.extract_forms,
-            )
+            if parsing_strategy == "fast":
+                # Fast mode - skip hi_res model, faster but less accurate
+                logger.info("Using FAST parsing mode (no layout model)")
+                elements = partition_pdf(
+                    filename=file_path,
+                    strategy="fast",
+                    languages=self.ocr_languages,
+                    include_page_breaks=True,
+                )
+            else:
+                # Enable parallel processing for hi_res mode
+                num_threads = multiprocessing.cpu_count()
+                os.environ["UNSTRUCTURED_PARALLEL_MODE_ENABLED"] = "true"
+                os.environ["UNSTRUCTURED_PARALLEL_MODE_THREADS"] = str(num_threads)
+                logger.info(f"Parallel mode enabled with {num_threads} threads")
+
+                # Full hi_res mode with layout detection
+                elements = partition_pdf(
+                    filename=file_path,
+                    strategy="hi_res",
+                    hi_res_model_name=self.hi_res_model,  # Use YOLOX for better layout detection
+                    infer_table_structure=True,
+                    languages=self.ocr_languages,
+                    include_page_breaks=True,  # Better page tracking
+                    # Extract visual elements as images
+                    extract_image_block_types=self.VISUAL_ELEMENT_TYPES if self.extract_visual_elements else None,
+                    extract_image_block_to_payload=self.extract_visual_elements,  # Base64 in metadata
+                    # Optional features
+                    detect_language_per_element=self.detect_language_per_element,
+                    extract_forms=self.extract_forms,
+                )
         elif file_path.lower().endswith(('.xlsx', '.xls')):
             # Excel files - partition each sheet as tables
             elements = partition_xlsx(

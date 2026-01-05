@@ -3,6 +3,20 @@ Hybrid Search combining BM25, Dense, and ColPali retrieval.
 
 Uses Reciprocal Rank Fusion (RRF) to combine results from multiple
 retrieval methods, providing the best of both keyword and semantic search.
+
+Architecture for ColPali Integration:
+=====================================
+ColPali operates at PAGE level (visual understanding), while BM25/Dense operate
+at CHUNK level (text retrieval). This module implements industry-standard
+Late Interaction with Page-to-Chunk Score Propagation:
+
+1. ColPali searches full pages and returns (document_id, page_number, score)
+2. BM25/Dense search chunks, each chunk has page_number in metadata
+3. ColPali scores are propagated to chunks based on their page_number
+4. RRF fusion combines all three signals at the chunk level
+
+This enables visual queries like "show me the table with costs" to boost
+chunks that appear on visually relevant pages.
 """
 from typing import List, Dict, Any, Optional, Tuple, TYPE_CHECKING
 
@@ -39,6 +53,10 @@ class HybridResult:
     dense_rank: Optional[int] = None
     colpali_score: Optional[float] = None
     colpali_rank: Optional[int] = None
+
+    # ColPali propagation tracking (for debugging/transparency)
+    colpali_page_match: bool = False  # Score from same page
+    colpali_doc_match: bool = False   # Score from same document (fallback)
 
 
 class ReciprocalRankFusion:
@@ -286,7 +304,10 @@ class HybridSearcher:
                 all_results_by_id[doc_id]["dense_score"] = r.score
                 all_results_by_id[doc_id]["dense_rank"] = rank
 
-        # ColPali search
+        # ColPali search with Page-to-Chunk Score Propagation
+        # Industry-standard approach: ColPali returns page-level scores, we propagate to chunks
+        colpali_page_scores: Dict[Tuple[str, int], Tuple[float, int]] = {}  # (doc_id, page_num) -> (score, rank)
+
         if RetrievalMethod.COLPALI in methods and self.colpali_store and self.colpali_embedder:
             query_embedding = self.colpali_embedder.embed_query(query)
             colpali_results = self.colpali_store.search(
@@ -294,20 +315,83 @@ class HybridSearcher:
                 limit=fetch_limit,
                 filters=filters
             )
-            # Use original_id from payload for fusion (Qdrant converts IDs to UUIDs)
-            ranked_lists[RetrievalMethod.COLPALI.value] = [
-                (r.payload.get("original_id", r.id), r.score) for r in colpali_results
-            ]
+            logger.info(f"ColPali returned {len(colpali_results)} page results")
+
+            # Build page-level score map for propagation to chunks
+            # ColPali returns pages with IDs like "{document_id}_page_{N}"
             for rank, r in enumerate(colpali_results, 1):
-                # Use original_id for consistent ID across all methods
-                doc_id = r.payload.get("original_id", r.id)
-                if doc_id not in all_results_by_id:
-                    all_results_by_id[doc_id] = {
-                        "text": None,  # ColPali returns pages, not text chunks
-                        "metadata": r.payload
-                    }
-                all_results_by_id[doc_id]["colpali_score"] = r.score
-                all_results_by_id[doc_id]["colpali_rank"] = rank
+                original_id = r.payload.get("original_id", r.id)
+                document_id = r.payload.get("document_id")
+                page_number = r.payload.get("page_number")
+
+                if document_id and page_number is not None:
+                    # Store page-level scores for chunk propagation
+                    colpali_page_scores[(document_id, page_number)] = (r.score, rank)
+                    logger.debug(
+                        f"ColPali page: doc={document_id}, page={page_number}, "
+                        f"score={r.score:.4f}, rank={rank}"
+                    )
+
+            # Now propagate ColPali scores to chunks that are already in our results
+            # This is the key step for proper fusion
+            chunk_colpali_scores: List[Tuple[str, float]] = []
+
+            for chunk_id, chunk_data in all_results_by_id.items():
+                metadata = chunk_data.get("metadata", {})
+                chunk_doc_id = metadata.get("document_id")
+                chunk_page = metadata.get("page_number")
+
+                if chunk_doc_id and chunk_page is not None:
+                    page_key = (chunk_doc_id, chunk_page)
+                    if page_key in colpali_page_scores:
+                        page_score, page_rank = colpali_page_scores[page_key]
+                        # Propagate page score to chunk
+                        chunk_data["colpali_score"] = page_score
+                        chunk_data["colpali_rank"] = page_rank
+                        chunk_data["colpali_page_match"] = True
+                        chunk_colpali_scores.append((chunk_id, page_score))
+                        logger.debug(
+                            f"Propagated ColPali score to chunk {chunk_id}: "
+                            f"page={chunk_page}, score={page_score:.4f}"
+                        )
+
+            # If we found matching chunks, create the ranked list for RRF fusion
+            if chunk_colpali_scores:
+                # Sort by score descending to get proper ranking
+                chunk_colpali_scores.sort(key=lambda x: x[1], reverse=True)
+                ranked_lists[RetrievalMethod.COLPALI.value] = chunk_colpali_scores
+                logger.info(
+                    f"ColPali propagated to {len(chunk_colpali_scores)} chunks "
+                    f"from {len(colpali_page_scores)} relevant pages"
+                )
+            else:
+                # Fallback: No chunk overlap, but we still want to boost documents
+                # that have visually relevant pages. Use document-level boosting.
+                doc_scores: Dict[str, Tuple[float, int]] = {}
+                for (doc_id, _), (score, rank) in colpali_page_scores.items():
+                    if doc_id not in doc_scores or score > doc_scores[doc_id][0]:
+                        doc_scores[doc_id] = (score, rank)
+
+                # Create pseudo-rankings for any chunks from these documents
+                doc_chunk_scores: List[Tuple[str, float]] = []
+                for chunk_id, chunk_data in all_results_by_id.items():
+                    metadata = chunk_data.get("metadata", {})
+                    chunk_doc_id = metadata.get("document_id")
+                    if chunk_doc_id and chunk_doc_id in doc_scores:
+                        doc_score, doc_rank = doc_scores[chunk_doc_id]
+                        # Apply document-level boost (slightly lower weight)
+                        boosted_score = doc_score * 0.8
+                        chunk_data["colpali_score"] = boosted_score
+                        chunk_data["colpali_rank"] = doc_rank
+                        chunk_data["colpali_doc_match"] = True
+                        doc_chunk_scores.append((chunk_id, boosted_score))
+
+                if doc_chunk_scores:
+                    doc_chunk_scores.sort(key=lambda x: x[1], reverse=True)
+                    ranked_lists[RetrievalMethod.COLPALI.value] = doc_chunk_scores
+                    logger.info(
+                        f"ColPali document-level boost applied to {len(doc_chunk_scores)} chunks"
+                    )
 
         # Get weights (dynamic or custom)
         use_weights = self._get_weights_for_query(query, weights)
@@ -338,6 +422,8 @@ class HybridSearcher:
                 dense_rank=result_data.get("dense_rank"),
                 colpali_score=result_data.get("colpali_score"),
                 colpali_rank=result_data.get("colpali_rank"),
+                colpali_page_match=result_data.get("colpali_page_match", False),
+                colpali_doc_match=result_data.get("colpali_doc_match", False),
             )
             results.append(result)
 
