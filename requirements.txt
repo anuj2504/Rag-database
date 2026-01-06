@@ -46,9 +46,6 @@ transformers>=4.40.0
 # ColPali - Visual document understanding
 colpali-engine>=0.3.0
 
-# Google Gemini - VLM for multimodal answer generation
-google-generativeai>=0.8.0
-
 # ============================================================================
 # VECTOR DATABASES
 # ============================================================================
