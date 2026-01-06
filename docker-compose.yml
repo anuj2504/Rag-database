@@ -1,4 +1,9 @@
-version: '3.8'
+# ============================================================================
+# Docker Compose - Local Development
+# ============================================================================
+# Usage: docker-compose up -d
+# For production, use: docker-compose -f docker-compose.prod.yml up -d
+# ============================================================================
 
 services:
   # PostgreSQL for metadata storage
@@ -21,9 +26,9 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # Qdrant vector database
+  # Qdrant vector database (local)
   qdrant:
-    image: qdrant/qdrant:v1.10.0
+    image: qdrant/qdrant:v1.12.1
     container_name: rag_qdrant
     ports:
       - "6333:6333"  # REST API
@@ -54,9 +59,11 @@ services:
       - QDRANT_PORT=6333
       - ENABLE_COLPALI=${ENABLE_COLPALI:-true}
       - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - WORKERS=2
     volumes:
-      - ./data:/app/data  # Persist BM25 index
-      - ./documents:/app/documents  # Mount documents directory
+      - ./data:/app/data
+      - ./documents:/app/documents
+      - ./logs:/app/logs
     depends_on:
       postgres:
         condition: service_healthy
@@ -69,43 +76,9 @@ services:
       retries: 3
     restart: unless-stopped
 
-  # Optional: Elasticsearch for production BM25 (instead of in-memory)
-  # elasticsearch:
-  #   image: elasticsearch:8.14.0
-  #   container_name: rag_elasticsearch
-  #   environment:
-  #     - discovery.type=single-node
-  #     - xpack.security.enabled=false
-  #     - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
-  #   ports:
-  #     - "9200:9200"
-  #   volumes:
-  #     - elasticsearch_data:/usr/share/elasticsearch/data
-  #   healthcheck:
-  #     test: ["CMD-SHELL", "curl -s http://localhost:9200/_cluster/health | grep -vq '\"status\":\"red\"'"]
-  #     interval: 20s
-  #     timeout: 10s
-  #     retries: 5
-
-  # Optional: Redis for caching (future enhancement)
-  # redis:
-  #   image: redis:7-alpine
-  #   container_name: rag_redis
-  #   ports:
-  #     - "6379:6379"
-  #   volumes:
-  #     - redis_data:/data
-  #   healthcheck:
-  #     test: ["CMD", "redis-cli", "ping"]
-  #     interval: 10s
-  #     timeout: 5s
-  #     retries: 5
-
 volumes:
   postgres_data:
   qdrant_data:
-  # elasticsearch_data:
-  # redis_data:
 
 networks:
   default:

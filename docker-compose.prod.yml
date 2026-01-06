@@ -1,0 +1,82 @@
+# ============================================================================
+# Docker Compose - Production Deployment
+# ============================================================================
+# Usage: docker-compose -f docker-compose.prod.yml up -d
+#
+# This configuration is optimized for production:
+# - Uses external managed Qdrant (Qdrant Cloud or self-hosted)
+# - Uses external managed PostgreSQL (RDS, Cloud SQL, etc.)
+# - Runs API with multiple workers
+# - Includes resource limits
+# ============================================================================
+
+services:
+  # RAG API service
+  api:
+    image: ${DOCKER_REGISTRY:-}rag-api:${VERSION:-latest}
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: rag_api
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # Database connection (external managed PostgreSQL)
+      - POSTGRES_URL=${POSTGRES_URL}
+
+      # Qdrant connection (external managed Qdrant)
+      - QDRANT_URL=${QDRANT_URL}
+      - QDRANT_API_KEY=${QDRANT_API_KEY}
+      # Or use host/port for self-hosted:
+      # - QDRANT_HOST=${QDRANT_HOST}
+      # - QDRANT_PORT=${QDRANT_PORT:-6333}
+
+      # Feature flags
+      - ENABLE_COLPALI=${ENABLE_COLPALI:-true}
+      - PARSING_STRATEGY=${PARSING_STRATEGY:-hi_res}
+
+      # Embedding models
+      - DENSE_MODEL=${DENSE_MODEL:-BAAI/bge-base-en-v1.5}
+      - COLPALI_MODEL=${COLPALI_MODEL:-vidore/colpali-v1.2}
+
+      # Optional: OpenAI for embeddings
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+
+      # Logging
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+
+      # Performance
+      - WORKERS=${WORKERS:-4}
+      - CHUNK_SIZE=${CHUNK_SIZE:-512}
+      - CHUNK_OVERLAP=${CHUNK_OVERLAP:-50}
+    volumes:
+      - api_data:/app/data
+      - api_logs:/app/logs
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 120s
+      retries: 3
+    restart: always
+    deploy:
+      resources:
+        limits:
+          cpus: '4'
+          memory: 8G
+        reservations:
+          cpus: '2'
+          memory: 4G
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
+
+volumes:
+  api_data:
+  api_logs:
+
+networks:
+  default:
+    name: rag_network_prod

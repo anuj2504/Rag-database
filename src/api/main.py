@@ -702,6 +702,253 @@ async def delete_document(
 
 
 # ============================================================================
+# Q&A Endpoint (VLM-powered RAG)
+# ============================================================================
+
+class AskRequest(BaseModel):
+    """RAG question-answering request with multimodal support."""
+    query: str = Field(..., min_length=1, max_length=2000, description="Question to answer")
+    limit: int = Field(default=5, ge=1, le=20, description="Number of chunks to retrieve")
+    include_images: bool = Field(default=True, description="Include visual context (page images)")
+    max_images: int = Field(default=5, ge=0, le=10, description="Maximum images to include")
+    model: Optional[str] = Field(default=None, description="VLM model override (e.g., gemini-1.5-pro)")
+    temperature: float = Field(default=0.3, ge=0, le=1, description="Generation temperature")
+    document_type: Optional[str] = Field(default=None, description="Filter by document type")
+
+
+class AskResponse(BaseModel):
+    """RAG question-answering response."""
+    query: str
+    answer: str
+    sources: List[SearchResult]
+    images_used: int
+    model: str
+    generation_time_ms: int
+    retrieval_time_ms: int
+    organization_id: str
+
+
+# Global VLM generator (initialized on first use)
+vlm_generator = None
+
+
+def get_vlm_generator():
+    """Get or create VLM generator instance."""
+    global vlm_generator
+    if vlm_generator is None:
+        try:
+            from src.generation import create_vlm_generator
+            vlm_generator = create_vlm_generator()
+            logger.info(f"VLM generator initialized: {vlm_generator.model_name}")
+        except Exception as e:
+            logger.error(f"Failed to initialize VLM generator: {e}")
+            raise HTTPException(
+                status_code=503,
+                detail=f"VLM service not available: {str(e)}"
+            )
+    return vlm_generator
+
+
+@app.post("/ask", response_model=AskResponse, tags=["Q&A"])
+async def ask_question(
+    request: AskRequest,
+    tenant: TenantContext = Depends(get_tenant_context)
+):
+    """
+    Ask a question and get a generated answer with sources.
+
+    This endpoint implements multimodal RAG:
+    1. Retrieves relevant text chunks via hybrid search (BM25 + Dense + ColPali)
+    2. Fetches relevant page images for visual context (if include_images=True)
+    3. Generates an answer using Google Gemini VLM
+    4. Returns the answer with source citations
+
+    **Visual Context**: When include_images=True, the system will include
+    page images from documents where ColPali found visual matches. This
+    enables answering questions about tables, charts, and figures.
+
+    **Example queries**:
+    - "What does the table on page 3 show?"
+    - "Summarize the contract terms"
+    - "What are the payment milestones?"
+    """
+    import time
+    retrieval_start = time.time()
+
+    if not hybrid_searcher:
+        raise HTTPException(status_code=503, detail="Search service not initialized")
+
+    try:
+        # Build filters with tenant isolation
+        filters = tenant.to_filter_dict()
+        if request.document_type:
+            filters["document_type"] = request.document_type
+
+        # Step 1: Retrieve relevant chunks via hybrid search
+        search_results = hybrid_searcher.search(
+            query=request.query,
+            limit=request.limit,
+            filters=filters
+        )
+
+        retrieval_time = int((time.time() - retrieval_start) * 1000)
+
+        if not search_results:
+            return AskResponse(
+                query=request.query,
+                answer="I couldn't find any relevant information in the documents for your query.",
+                sources=[],
+                images_used=0,
+                model="none",
+                generation_time_ms=0,
+                retrieval_time_ms=retrieval_time,
+                organization_id=tenant.organization_id,
+            )
+
+        # Step 2: Extract text context and metadata
+        text_context = []
+        metadata_list = []
+        for r in search_results:
+            text_context.append(r.text or "")
+            metadata_list.append({
+                "filename": r.metadata.get("filename"),
+                "page_number": r.metadata.get("page_number"),
+                "section_title": r.metadata.get("section_title"),
+                "document_type": r.metadata.get("document_type"),
+            })
+
+        # Step 3: Fetch page images if requested and available
+        images = []
+        if request.include_images and request.max_images > 0:
+            images = await _fetch_context_images(
+                search_results,
+                max_images=request.max_images,
+                tenant=tenant
+            )
+
+        # Step 4: Generate answer using VLM
+        generator = get_vlm_generator()
+
+        # Override model if specified
+        if request.model and request.model != generator.model_name:
+            from src.generation import GeminiVLMGenerator
+            temp_generator = GeminiVLMGenerator(model=request.model)
+            gen_result = temp_generator.generate(
+                query=request.query,
+                text_context=text_context,
+                images=images if images else None,
+                metadata=metadata_list,
+                temperature=request.temperature,
+            )
+        else:
+            gen_result = generator.generate(
+                query=request.query,
+                text_context=text_context,
+                images=images if images else None,
+                metadata=metadata_list,
+                temperature=request.temperature,
+            )
+
+        # Check for generation errors
+        if gen_result.error:
+            logger.error(f"VLM generation error: {gen_result.error}")
+            answer = f"Error generating answer: {gen_result.error}"
+        else:
+            answer = gen_result.answer
+
+        # Build response with sources
+        sources = [
+            SearchResult(
+                id=r.id,
+                score=r.final_score,
+                text=r.text,
+                metadata=r.metadata,
+                bm25_rank=r.bm25_rank,
+                bm25_score=r.bm25_score,
+                dense_rank=r.dense_rank,
+                dense_score=r.dense_score,
+                colpali_rank=r.colpali_rank,
+                colpali_score=r.colpali_score,
+                colpali_page_match=r.colpali_page_match,
+                colpali_doc_match=r.colpali_doc_match,
+            )
+            for r in search_results
+        ]
+
+        return AskResponse(
+            query=request.query,
+            answer=answer,
+            sources=sources,
+            images_used=gen_result.images_used,
+            model=gen_result.model,
+            generation_time_ms=gen_result.generation_time_ms,
+            retrieval_time_ms=retrieval_time,
+            organization_id=tenant.organization_id,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Ask endpoint error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+async def _fetch_context_images(
+    search_results: list,
+    max_images: int,
+    tenant: TenantContext
+) -> List:
+    """
+    Fetch page images for search results that have ColPali matches.
+
+    This retrieves stored page images to provide visual context to the VLM.
+    Images are fetched for pages where ColPali found visual relevance.
+    """
+    from PIL import Image
+    import io
+
+    images = []
+
+    # Collect unique (document_id, page_number) pairs from results with ColPali matches
+    pages_to_fetch = []
+    seen_pages = set()
+
+    for r in search_results:
+        # Prioritize results with direct page matches
+        if r.colpali_page_match or r.colpali_doc_match:
+            doc_id = r.metadata.get("document_id")
+            page_num = r.metadata.get("page_number")
+
+            if doc_id and page_num and (doc_id, page_num) not in seen_pages:
+                pages_to_fetch.append((doc_id, page_num, r.colpali_score or 0))
+                seen_pages.add((doc_id, page_num))
+
+    # Sort by ColPali score (highest first) and limit
+    pages_to_fetch.sort(key=lambda x: x[2], reverse=True)
+    pages_to_fetch = pages_to_fetch[:max_images]
+
+    # Try to fetch images from metadata store
+    if pipeline and pipeline.metadata_store and pages_to_fetch:
+        for doc_id, page_num, _ in pages_to_fetch:
+            try:
+                # Try to get page record
+                page = pipeline.metadata_store.get_page(doc_id, page_num)
+                if page and hasattr(page, 'image_data') and page.image_data:
+                    # Decode stored image
+                    img = Image.open(io.BytesIO(page.image_data))
+                    images.append(img)
+                    logger.debug(f"Fetched image for {doc_id} page {page_num}")
+            except Exception as e:
+                logger.warning(f"Could not fetch image for {doc_id} page {page_num}: {e}")
+
+    # If no stored images, try to get from document path (fallback)
+    if not images and pages_to_fetch:
+        logger.info("No stored images found, skipping visual context")
+
+    return images
+
+
+# ============================================================================
 # Run
 # ============================================================================
 

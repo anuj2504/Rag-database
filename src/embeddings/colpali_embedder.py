@@ -78,7 +78,7 @@ class ColPaliEmbedder:
     def embed_images(
         self,
         images: List[Image.Image],
-        batch_size: int = 4
+        batch_size: int = 8
     ) -> List[np.ndarray]:
         """
         Embed document page images.
